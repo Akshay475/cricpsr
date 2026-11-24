@@ -74,7 +74,7 @@ jobs:
           gem install puppet --no-document
           puppet parser validate provisioning/puppet/manifests/site.pp
       - name: Validate Nginx configuration
-        run: docker run --rm -v "$PWD/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro" nginx:1.29-alpine nginx -t
+        run: docker run --rm --add-host frontend:127.0.0.1 --add-host backend:127.0.0.1 -v "$PWD/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro" nginx:1.29-alpine nginx -t
       - name: Validate Grafana dashboard JSON
         run: node -e "JSON.parse(require('fs').readFileSync('monitoring/grafana/dashboards/cricpsr-overview.json', 'utf8'))"
 
@@ -87,4 +87,4 @@ jobs:
       - name: Build frontend image
         run: docker build --build-arg NEXT_PUBLIC_API_URL=/api -t cricpsr-frontend:ci ./frontend
       - name: Build MongoDB exporter image
-        run: docker build -t cricpsr-mongodb-exporter:ci -f mongodb-exporter.Dockerfile ./monitoring
+        run: docker build -t cricpsr-mongodb-exporter:ci -f monitoring/mongodb-exporter.Dockerfile ./monitoring

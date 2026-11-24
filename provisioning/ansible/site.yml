@@ -1,0 +1,235 @@
+---
+- name: Provision and deploy CRICPSR
+  hosts: production
+  become: true
+  vars_files:
+    - group_vars/production.yml
+  tasks:
+    - name: Require Ubuntu hosts for this playbook
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+        fail_msg: "This playbook currently supports Ubuntu LTS hosts only."
+
+    - name: Install Docker repository prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - git
+          - python3-debian
+          - awscli
+        state: present
+        update_cache: true
+
+    - name: Create apt keyring directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Install Docker signing key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+    - name: Read Debian package architecture
+      ansible.builtin.command: dpkg --print-architecture
+      register: docker_architecture
+      changed_when: false
+
+    - name: Configure Docker apt repository
+      ansible.builtin.deb822_repository:
+        name: docker
+        types: deb
+        uris: https://download.docker.com/linux/ubuntu
+        suites: "{{ ansible_distribution_release }}"
+        components: stable
+        architectures:
+          - "{{ docker_architecture.stdout }}"
+        signed_by: /etc/apt/keyrings/docker.asc
+        state: present
+
+    - name: Install Docker Engine and Compose plugin
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Enable Docker service
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Ensure the EC2 Systems Manager agent is running
+      ansible.builtin.systemd:
+        name: snap.amazon-ssm-agent.amazon-ssm-agent.service
+        enabled: true
+        state: started
+
+    - name: Ensure deployment user exists with Docker access
+      ansible.builtin.user:
+        name: "{{ cricpsr_deploy_user }}"
+        shell: /bin/bash
+        create_home: true
+        groups:
+          - docker
+        append: true
+
+    - name: Create AWS CLI configuration directory
+      ansible.builtin.file:
+        path: "/home/{{ cricpsr_deploy_user }}/.aws"
+        state: directory
+        owner: "{{ cricpsr_deploy_user }}"
+        group: "{{ cricpsr_deploy_user }}"
+        mode: "0700"
+
+    - name: Configure AWS CLI region without static credentials
+      ansible.builtin.copy:
+        content: "[default]\nregion = {{ aws_region }}\n"
+        dest: "/home/{{ cricpsr_deploy_user }}/.aws/config"
+        owner: "{{ cricpsr_deploy_user }}"
+        group: "{{ cricpsr_deploy_user }}"
+        mode: "0600"
+
+    - name: Create deployment SSH directory
+      ansible.builtin.file:
+        path: "/home/{{ cricpsr_deploy_user }}/.ssh"
+        state: directory
+        owner: "{{ cricpsr_deploy_user }}"
+        group: "{{ cricpsr_deploy_user }}"
+        mode: "0700"
+
+    - name: Install read-only repository deploy key
+      ansible.builtin.copy:
+        content: "{{ github_deploy_private_key }}\n"
+        dest: "/home/{{ cricpsr_deploy_user }}/.ssh/id_ed25519"
+        owner: "{{ cricpsr_deploy_user }}"
+        group: "{{ cricpsr_deploy_user }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Pin GitHub SSH host key
+      ansible.builtin.copy:
+        content: "{{ github_ssh_known_hosts }}\n"
+        dest: "/home/{{ cricpsr_deploy_user }}/.ssh/known_hosts"
+        owner: "{{ cricpsr_deploy_user }}"
+        group: "{{ cricpsr_deploy_user }}"
+        mode: "0600"
+
+    - name: Create application directory
+      ansible.builtin.file:
+        path: /opt/cricpsr
+        state: directory
+        owner: "{{ cricpsr_deploy_user }}"
+        group: "{{ cricpsr_deploy_user }}"
+        mode: "0750"
+
+    - name: Check out the selected release
+      become_user: "{{ cricpsr_deploy_user }}"
+      ansible.builtin.git:
+        repo: "{{ cricpsr_repository }}"
+        dest: /opt/cricpsr
+        version: "{{ cricpsr_git_ref }}"
+        key_file: "/home/{{ cricpsr_deploy_user }}/.ssh/id_ed25519"
+        accept_hostkey: false
+
+    - name: Log in to GitHub Container Registry
+      ansible.builtin.command:
+        argv:
+          - docker
+          - login
+          - ghcr.io
+          - --username
+          - "{{ github_registry_user }}"
+          - --password-stdin
+        stdin: "{{ github_registry_token }}"
+      become_user: "{{ cricpsr_deploy_user }}"
+      no_log: true
+      changed_when: false
+
+    - name: Write MongoDB replica-set keyfile
+      ansible.builtin.copy:
+        content: "{{ mongo_keyfile_content }}\n"
+        dest: /opt/cricpsr/mongo-keyfile
+        owner: root
+        group: root
+        mode: "0400"
+      no_log: true
+
+    - name: Write production environment
+      ansible.builtin.template:
+        src: templates/production.env.j2
+        dest: /opt/cricpsr/.env
+        owner: "{{ cricpsr_deploy_user }}"
+        group: "{{ cricpsr_deploy_user }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Validate MongoDB backup S3 prefix
+      ansible.builtin.assert:
+        that:
+          - backup_s3_uri is match('^s3://[a-z0-9][a-z0-9-]{1,61}[a-z0-9]/cricpsr$')
+        fail_msg: "Set backup_s3_uri to the cricpsr prefix of the Terraform-created private bucket."
+
+    - name: Pull selected application images
+      become_user: "{{ cricpsr_deploy_user }}"
+      ansible.builtin.command: docker compose pull
+      args:
+        chdir: /opt/cricpsr
+      changed_when: true
+
+    - name: Start CRICPSR services
+      become_user: "{{ cricpsr_deploy_user }}"
+      ansible.builtin.command: docker compose up -d --no-build --remove-orphans
+      args:
+        chdir: /opt/cricpsr
+      changed_when: true
+
+    - name: Create restricted backup directory
+      ansible.builtin.file:
+        path: /var/backups/cricpsr
+        state: directory
+        owner: "{{ cricpsr_deploy_user }}"
+        group: docker
+        mode: "0750"
+
+    - name: Install scheduled backup service
+      ansible.builtin.template:
+        src: templates/cricpsr-backup.service.j2
+        dest: /etc/systemd/system/cricpsr-backup.service
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Install scheduled backup timer
+      ansible.builtin.copy:
+        remote_src: true
+        src: /opt/cricpsr/provisioning/systemd/cricpsr-backup.timer
+        dest: /etc/systemd/system/cricpsr-backup.timer
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Enable daily database backup
+      ansible.builtin.systemd:
+        name: cricpsr-backup.timer
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Verify application and database readiness
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8080/api/health
+        status_code: 200
+      register: nginx_health
+      retries: 12
+      delay: 5
+      until: nginx_health.status == 200

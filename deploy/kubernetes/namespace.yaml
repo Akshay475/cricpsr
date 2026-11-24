@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cricpsr
+  labels:
+    app.kubernetes.io/part-of: cricpsr
+    pod-security.kubernetes.io/enforce: baseline

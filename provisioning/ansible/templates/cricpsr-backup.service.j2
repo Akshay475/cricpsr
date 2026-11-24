@@ -1,0 +1,17 @@
+[Unit]
+Description=CRICPSR MongoDB backup
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+User={{ cricpsr_deploy_user }}
+Group=docker
+WorkingDirectory=/opt/cricpsr
+Environment=BACKUP_DIR=/var/backups/cricpsr
+Environment=BACKUP_RETENTION_DAYS=14
+Environment=S3_BACKUP_URI={{ backup_s3_uri }}
+Environment=AWS_DEFAULT_REGION={{ aws_region }}
+ExecStart=/bin/bash /opt/cricpsr/scripts/backup-mongodb.sh
+PrivateTmp=true
+NoNewPrivileges=true

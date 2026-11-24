@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: CRICPSR
+    orgId: 1
+    folder: CRICPSR
+    type: file
+    disableDeletion: true
+    editable: false
+    options:
+      path: /var/lib/grafana/dashboards

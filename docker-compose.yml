@@ -1,0 +1,197 @@
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  mongodb:
+      image: mongo:8
+      restart: unless-stopped
+      command: ["bash", "-lc", "cp /run/secrets/mongo-keyfile /tmp/mongo-keyfile && chmod 400 /tmp/mongo-keyfile && mongod --replSet rs0 --bind_ip_all --keyFile /tmp/mongo-keyfile"]
+      volumes:
+        - mongodb_data:/data/db
+        - ${MONGO_KEYFILE_PATH:?Set MONGO_KEYFILE_PATH}:/run/secrets/mongo-keyfile:ro
+      environment:
+        MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:?Set MONGO_INITDB_ROOT_USERNAME}
+        MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:?Set MONGO_INITDB_ROOT_PASSWORD}
+        MONGO_INITDB_DATABASE: cricpsr
+      ports:
+        - "127.0.0.1:27018:27017"
+      healthcheck:
+        test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+        interval: 10s
+        timeout: 5s
+        retries: 10
+      logging: *default-logging
+
+  mongodb-init:
+      image: mongo:8
+      depends_on:
+        mongodb:
+          condition: service_healthy
+      restart: "no"
+      entrypoint:
+        - bash
+        - -lc
+        - >
+          mongosh "mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@mongodb:27017/admin?authSource=admin"
+          --eval 'const s=db.adminCommand({replSetGetStatus:1}); if(!s.ok){if(s.code===94){rs.initiate({_id:"rs0",members:[{_id:0,host:"mongodb:27017"}]})}else{throw new Error(JSON.stringify(s))}}'
+      logging: *default-logging
+
+  redis:
+      image: redis:7-alpine
+      restart: unless-stopped
+      command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$${REDIS_PASSWORD}\""]
+      environment:
+        REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      volumes:
+        - redis_data:/data
+      ports:
+        - "127.0.0.1:6379:6379"
+      healthcheck:
+        test: ["CMD-SHELL", "REDISCLI_AUTH=$$REDIS_PASSWORD redis-cli ping | grep -q PONG"]
+        interval: 10s
+        timeout: 5s
+        retries: 10
+      logging: *default-logging
+
+  backend:
+      image: ${CRICPSR_IMAGE:-cricpsr}/backend:${CRICPSR_TAG:-local}
+      build:
+        context: ./backend
+      restart: unless-stopped
+      env_file:
+        - .env
+      environment:
+        NODE_ENV: production
+        APP_PORT: "4000"
+        FRONTEND_URL: ${APP_ORIGIN:?Set APP_ORIGIN}
+        JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?Set JWT_ACCESS_SECRET}
+        MONGODB_URI: "mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@mongodb:27017/cricpsr?authSource=admin&replicaSet=rs0"
+        REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379"
+      expose:
+        - "4000"
+      depends_on:
+        mongodb:
+          condition: service_healthy
+        mongodb-init:
+          condition: service_completed_successfully
+        redis:
+          condition: service_healthy
+      healthcheck:
+        test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+        interval: 15s
+        timeout: 5s
+        retries: 5
+        start_period: 20s
+      logging: *default-logging
+
+  frontend:
+      image: ${CRICPSR_IMAGE:-cricpsr}/frontend:${CRICPSR_TAG:-local}
+      build:
+        context: ./frontend
+        args:
+          NEXT_PUBLIC_API_URL: /api
+      restart: unless-stopped
+      expose:
+        - "3000"
+      depends_on:
+        backend:
+          condition: service_healthy
+      healthcheck:
+        test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+        interval: 15s
+        timeout: 5s
+        retries: 5
+        start_period: 20s
+      logging: *default-logging
+
+  nginx:
+      image: nginx:1.29-alpine
+      restart: unless-stopped
+      ports:
+        - "${HTTP_PORT:-8080}:80"
+      volumes:
+        - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      depends_on:
+        frontend:
+          condition: service_healthy
+        backend:
+          condition: service_healthy
+      healthcheck:
+        test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/healthz"]
+        interval: 15s
+        timeout: 5s
+        retries: 3
+      logging: *default-logging
+
+  mongodb-exporter:
+      image: ${CRICPSR_IMAGE:-cricpsr}/mongodb-exporter:${CRICPSR_TAG:-local}
+      build:
+        context: ./monitoring
+        dockerfile: mongodb-exporter.Dockerfile
+      restart: unless-stopped
+      command:
+        - --mongodb.uri=mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@mongodb:27017/admin?authSource=admin&replicaSet=rs0
+      depends_on:
+        mongodb:
+          condition: service_healthy
+      expose:
+        - "9216"
+      logging: *default-logging
+
+  redis-exporter:
+      image: oliver006/redis_exporter:v1.67.0
+      restart: unless-stopped
+      environment:
+        REDIS_ADDR: redis://redis:6379
+        REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+      depends_on:
+        redis:
+          condition: service_healthy
+      expose:
+        - "9121"
+      logging: *default-logging
+
+  prometheus:
+      image: prom/prometheus:v3.8.0
+      restart: unless-stopped
+      command:
+        - --config.file=/etc/prometheus/prometheus.yml
+        - --storage.tsdb.path=/prometheus
+        - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}
+      volumes:
+        - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+        - prometheus_data:/prometheus
+      ports:
+        - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9090}:9090"
+      depends_on:
+        - backend
+        - mongodb-exporter
+        - redis-exporter
+      logging: *default-logging
+
+  grafana:
+      image: grafana/grafana:12.2.0
+      restart: unless-stopped
+      environment:
+        GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:?Set GRAFANA_ADMIN_USER}
+        GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD}
+        GF_USERS_ALLOW_SIGN_UP: "false"
+      volumes:
+        - grafana_data:/var/lib/grafana
+        - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+        - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+        - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      ports:
+        - "127.0.0.1:3001:3000"
+      depends_on:
+        - prometheus
+      logging: *default-logging
+
+volumes:
+  mongodb_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:

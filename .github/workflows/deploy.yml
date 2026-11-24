@@ -1,0 +1,97 @@
+name: Deploy CRICPSR
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Published GHCR release tag (for example v1.2.3)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: cricpsr-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Validate deployment inputs
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          INSTANCE_ID: ${{ vars.AWS_INSTANCE_ID }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          DEPLOY_PATH="${DEPLOY_PATH:-/opt/cricpsr}"
+          [[ "$IMAGE_TAG" =~ ^[A-Za-z0-9._-]+$ ]]
+          [[ "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ ]]
+          [[ "$DEPLOY_PATH" != *..* ]]
+          [[ -n "$AWS_REGION" && -n "$AWS_ROLE_ARN" ]]
+          [[ "$INSTANCE_ID" =~ ^i-[A-Fa-f0-9]+$ ]]
+
+      - name: Configure AWS credentials with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: cricpsr-deploy-${{ github.run_id }}
+
+      - name: Deploy release through Systems Manager
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          INSTANCE_ID: ${{ vars.AWS_INSTANCE_ID }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          DEPLOY_PATH="${DEPLOY_PATH:-/opt/cricpsr}"
+          deploy_command="sudo -u cricpsr -H bash -lc 'cd \"$DEPLOY_PATH\" && CRICPSR_TAG=\"$IMAGE_TAG\" docker compose pull && CRICPSR_TAG=\"$IMAGE_TAG\" docker compose up -d --no-build --remove-orphans' && for attempt in \$(seq 1 36); do curl --fail --silent http://127.0.0.1:8080/api/health >/dev/null && sudo -u cricpsr -H bash -lc 'cd \"$DEPLOY_PATH\" && docker compose ps' && exit 0; sleep 5; done; exit 1"
+          parameters=$(jq -n --arg command "$deploy_command" '{commands: [$command]}')
+          command_id=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Deploy CRICPSR ${IMAGE_TAG}" \
+            --parameters "$parameters" \
+            --query 'Command.CommandId' \
+            --output text)
+
+          for attempt in $(seq 1 60); do
+            status=$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$command_id" \
+              --instance-id "$INSTANCE_ID" \
+              --query 'Status' \
+              --output text 2>/dev/null || true)
+            case "$status" in
+              Success)
+                aws ssm get-command-invocation \
+                  --region "$AWS_REGION" \
+                  --command-id "$command_id" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query 'StandardOutputContent' \
+                  --output text
+                exit 0
+                ;;
+              Failed|TimedOut|Cancelled|Cancelling|DeliveryTimedOut|Terminated)
+                aws ssm get-command-invocation \
+                  --region "$AWS_REGION" \
+                  --command-id "$command_id" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
+                  --output json
+                exit 1
+                ;;
+            esac
+            sleep 5
+          done
+          echo "Timed out waiting for the SSM deployment command" >&2
+          exit 1

@@ -37,6 +37,7 @@ type Profile = {
 export default function DashboardPage() {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [error, setError] = useState("");
+  const [profileMissing, setProfileMissing] = useState(false);
 
   useEffect(() => {
     const token = localStorage.getItem("cricpsr_access_token");
@@ -49,7 +50,13 @@ export default function DashboardPage() {
     })
       .then(async (response) => {
         const payload = await response.json();
-        if (!response.ok) throw new Error(payload.error?.message ?? "Unable to load profile");
+        if (!response.ok) {
+          if (response.status === 404 && payload.error?.code === "PROFILE_NOT_FOUND") {
+            setProfileMissing(true);
+            return;
+          }
+          throw new Error(payload.error?.message ?? "Unable to load profile");
+        }
         setProfile(payload.data);
       })
       .catch((caught) => setError(caught instanceof Error ? caught.message : "Unable to load profile"));
@@ -81,6 +88,7 @@ export default function DashboardPage() {
         <p className="eyebrow">Player dashboard</p>
         <h1>{profile?.primaryRole ? `${profile.primaryRole} dashboard` : "Your cricket profile"}</h1>
         {profile && <p>{profile.playerId} · {profile.stateId?.name} · {profile.districtId?.name} · {profile.zoneId?.name}</p>}
+        {profileMissing && <p>Complete your player profile to personalize your dashboard. <Link href="/profile">Complete profile</Link></p>}
         {error && <p className="error">{error} <Link href="/login">Login</Link></p>}
       </header>
 

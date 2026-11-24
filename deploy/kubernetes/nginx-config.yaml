@@ -1,0 +1,93 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  labels:
+    app.kubernetes.io/part-of: cricpsr
+data:
+  default.conf: |
+    upstream cricpsr_frontend {
+        server frontend:3000;
+        keepalive 32;
+    }
+
+    upstream cricpsr_backend {
+        server backend:4000;
+        keepalive 32;
+    }
+
+    upstream cricpsr_ratings {
+        server ratings:4000;
+        keepalive 32;
+    }
+
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        "" close;
+    }
+
+    map $http_x_forwarded_proto $forwarded_proto {
+        default $http_x_forwarded_proto;
+        ""      $scheme;
+    }
+
+    server {
+        listen 8080;
+        server_name _;
+        server_tokens off;
+
+        location = /healthz {
+            access_log off;
+            default_type text/plain;
+            return 200 "ok\n";
+        }
+
+        location /socket.io/ {
+            proxy_pass http://cricpsr_backend/socket.io/;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $forwarded_proto;
+            proxy_read_timeout 1h;
+            proxy_buffering off;
+        }
+
+        location ~ ^/api/players/[^/]+/(ratings|recalculate)(/|$) {
+            proxy_pass http://cricpsr_ratings;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $forwarded_proto;
+            proxy_read_timeout 60s;
+        }
+
+        location ^~ /api/rankings/ {
+            proxy_pass http://cricpsr_ratings;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $forwarded_proto;
+            proxy_read_timeout 60s;
+        }
+
+        location /api/ {
+            proxy_pass http://cricpsr_backend;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $forwarded_proto;
+            proxy_read_timeout 60s;
+        }
+
+        location / {
+            proxy_pass http://cricpsr_frontend;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $forwarded_proto;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+        }
+    }

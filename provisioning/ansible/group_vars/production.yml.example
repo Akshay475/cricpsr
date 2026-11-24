@@ -1,0 +1,25 @@
+---
+cricpsr_deploy_user: cricpsr
+cricpsr_repository: git@github.com:Akshay475/cricpsr.git
+cricpsr_git_ref: main
+cricpsr_image: ghcr.io/akshay475/cricpsr
+cricpsr_image_tag: REPLACE_WITH_RELEASE_TAG
+app_origin: https://cricpsr.example.com
+aws_region: us-east-1
+backup_s3_uri: s3://REPLACE_WITH_TERRAFORM_BUCKET/cricpsr
+
+github_registry_user: REPLACE_WITH_GITHUB_USER
+github_registry_token: REPLACE_WITH_READ_PACKAGES_TOKEN
+github_deploy_private_key: REPLACE_WITH_READ_ONLY_REPOSITORY_DEPLOY_KEY
+github_ssh_known_hosts: REPLACE_WITH_VERIFIED_GITHUB_SSH_HOST_KEY
+
+mongo_root_username: cricpsr
+mongo_root_password: REPLACE_WITH_URL_SAFE_RANDOM_SECRET
+mongo_keyfile_content: REPLACE_WITH_RANDOM_ALPHANUMERIC_KEY
+redis_password: REPLACE_WITH_RANDOM_SECRET
+jwt_access_secret: REPLACE_WITH_RANDOM_SECRET_AT_LEAST_32_CHARACTERS
+grafana_admin_user: admin
+grafana_admin_password: REPLACE_WITH_RANDOM_SECRET
+razorpay_key_id: ""
+razorpay_key_secret: ""
+razorpay_webhook_secret: ""

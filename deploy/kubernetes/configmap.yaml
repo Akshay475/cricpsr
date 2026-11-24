@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cricpsr-config
+  labels:
+    app.kubernetes.io/part-of: cricpsr
+data:
+  NODE_ENV: production
+  APP_PORT: "4000"
+  FRONTEND_URL: https://cricpsr.example.com
+  JWT_ACCESS_TTL: 15m
+  NEXT_TELEMETRY_DISABLED: "1"

@@ -1,0 +1,15 @@
+[Unit]
+Description=CRICPSR MongoDB backup
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+User=cricpsr
+Group=docker
+WorkingDirectory=/opt/cricpsr
+Environment=BACKUP_DIR=/var/backups/cricpsr
+Environment=BACKUP_RETENTION_DAYS=14
+ExecStart=/bin/bash /opt/cricpsr/scripts/backup-mongodb.sh
+PrivateTmp=true
+NoNewPrivileges=true

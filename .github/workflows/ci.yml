@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  application:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+  infrastructure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose and environment template
+        run: |
+          cp .env.example .env
+          openssl rand -hex 384 > mongo-keyfile
+          docker compose config --quiet
+      - name: Validate shell scripts
+        run: bash -n scripts/backup-mongodb.sh scripts/restore-mongodb.sh scripts/restore-mongodb-s3.sh
+      - name: Validate Kubernetes manifests and deployment helpers
+        run: |
+          set -euo pipefail
+          kubectl kustomize deploy/kubernetes > /tmp/cricpsr-kubernetes.yaml
+          for script in deploy/kubernetes/scripts/*.sh deploy/kubernetes/tests/*.sh; do
+            bash -n "$script"
+          done
+          bash deploy/kubernetes/tests/test-create-secrets.sh
+          bash deploy/kubernetes/tests/test-deploy-release.sh
+      - name: Test S3 restore safety
+        run: bash scripts/tests/test-restore-mongodb-s3.sh
+      - name: Test S3 backup upload
+        run: bash scripts/tests/test-backup-mongodb-s3.sh
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+      - name: Validate AWS infrastructure
+        run: |
+          terraform -chdir=provisioning/aws fmt -check -recursive
+          terraform -chdir=provisioning/aws init -backend=false -input=false
+          terraform -chdir=provisioning/aws validate
+      - name: Set up Python for Ansible
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate Ansible syntax
+        run: |
+          python -m pip install ansible-core
+          cp provisioning/ansible/group_vars/production.yml.example provisioning/ansible/group_vars/production.yml
+          ansible-playbook --syntax-check -i provisioning/ansible/inventory/production.ini.example provisioning/ansible/site.yml
+      - name: Set up Puppet parser
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+      - name: Validate Puppet manifest
+        run: |
+          gem install puppet --no-document
+          puppet parser validate provisioning/puppet/manifests/site.pp
+      - name: Validate Nginx configuration
+        run: docker run --rm -v "$PWD/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro" nginx:1.29-alpine nginx -t
+      - name: Validate Grafana dashboard JSON
+        run: node -e "JSON.parse(require('fs').readFileSync('monitoring/grafana/dashboards/cricpsr-overview.json', 'utf8'))"
+
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image
+        run: docker build -t cricpsr-backend:ci ./backend
+      - name: Build frontend image
+        run: docker build --build-arg NEXT_PUBLIC_API_URL=/api -t cricpsr-frontend:ci ./frontend
+      - name: Build MongoDB exporter image
+        run: docker build -t cricpsr-mongodb-exporter:ci -f mongodb-exporter.Dockerfile ./monitoring

@@ -1,0 +1,2 @@
+[production]
+cricpsr-prod ansible_host=REPLACE_WITH_SERVER_IP ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/cricpsr-ops

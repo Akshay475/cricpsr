@@ -1,0 +1,11 @@
+aws_region          = "us-east-1"
+app_domain          = "cricket.example.com"
+route53_zone_id     = "Z0123456789EXAMPLE"
+ssh_key_name        = "cricpsr-production"
+ssh_allowed_cidr    = "203.0.113.10/32"
+backup_bucket_name  = "cricpsr-production-backups-123456789012"
+github_repository   = "Akshay475/cricpsr"
+github_environment  = "production"
+instance_type       = "t3.large"
+root_volume_size_gb = 80
+backup_retention_days = 90

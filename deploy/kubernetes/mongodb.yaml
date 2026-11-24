@@ -1,0 +1,223 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-headless
+  labels:
+    app.kubernetes.io/name: mongodb
+    app.kubernetes.io/part-of: cricpsr
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: mongodb
+  ports:
+    - name: mongodb
+      port: 27017
+      targetPort: mongodb
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+  labels:
+    app.kubernetes.io/name: mongodb
+    app.kubernetes.io/part-of: cricpsr
+spec:
+  serviceName: mongodb-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mongodb
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mongodb
+        app.kubernetes.io/part-of: cricpsr
+    spec:
+      securityContext:
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: install-keyfile
+          image: mongo:8
+          command:
+            - /bin/sh
+            - -ec
+            - cp /source/mongo-keyfile /target/keyfile && chown 999:999 /target/keyfile && chmod 0400 /target/keyfile
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: mongo-keyfile-secret
+              mountPath: /source
+              readOnly: true
+            - name: mongo-keyfile
+              mountPath: /target
+      containers:
+        - name: mongodb
+          image: mongo:8
+          imagePullPolicy: IfNotPresent
+          args:
+            - mongod
+            - --replSet
+            - rs0
+            - --bind_ip_all
+            - --keyFile
+            - /etc/mongo-keyfile/keyfile
+          ports:
+            - name: mongodb
+              containerPort: 27017
+          env:
+            - name: MONGO_INITDB_ROOT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: cricpsr-secrets
+                  key: MONGO_INITDB_ROOT_USERNAME
+            - name: MONGO_INITDB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cricpsr-secrets
+                  key: MONGO_INITDB_ROOT_PASSWORD
+            - name: MONGO_INITDB_DATABASE
+              value: cricpsr
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - mongosh --quiet --host 127.0.0.1 --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval 'db.adminCommand({ping:1}).ok'
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - mongosh --quiet --host 127.0.0.1 --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval 'db.adminCommand({ping:1}).ok'
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - mongosh --quiet --host 127.0.0.1 --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval 'if (!db.hello().isWritablePrimary) quit(1)'
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 3Gi
+          volumeMounts:
+            - name: mongo-data
+              mountPath: /data/db
+            - name: mongo-keyfile
+              mountPath: /etc/mongo-keyfile
+              readOnly: true
+      volumes:
+        - name: mongo-keyfile-secret
+          secret:
+            secretName: cricpsr-secrets
+            items:
+              - key: mongo-keyfile
+                path: mongo-keyfile
+        - name: mongo-keyfile
+          emptyDir:
+            medium: Memory
+  volumeClaimTemplates:
+    - metadata:
+        name: mongo-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mongodb-rs-init
+  labels:
+    app.kubernetes.io/name: mongodb-rs-init
+    app.kubernetes.io/part-of: cricpsr
+spec:
+  backoffLimit: 12
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mongodb-rs-init
+        app.kubernetes.io/part-of: cricpsr
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: initialize-replica-set
+          image: mongo:8
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              mongo_uri="mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@mongodb-0.mongodb-headless.cricpsr.svc.cluster.local:27017/admin?authSource=admin&directConnection=true"
+              for attempt in $(seq 1 120); do
+                if mongosh "$mongo_uri" --quiet --eval 'db.adminCommand({ping:1}).ok' >/dev/null 2>&1; then
+                  break
+                fi
+                if [ "$attempt" -eq 120 ]; then
+                  echo "MongoDB did not become available for replica-set initialization" >&2
+                  exit 1
+                fi
+                sleep 5
+              done
+              mongosh "$mongo_uri" --quiet --eval '
+                const status = db.adminCommand({replSetGetStatus: 1});
+                if (!status.ok) {
+                  if (status.code === 94) {
+                    rs.initiate({
+                      _id: "rs0",
+                      members: [{_id: 0, host: "mongodb-0.mongodb-headless.cricpsr.svc.cluster.local:27017"}]
+                    });
+                  } else {
+                    throw new Error(JSON.stringify(status));
+                  }
+                }
+              '
+          env:
+            - name: MONGO_INITDB_ROOT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: cricpsr-secrets
+                  key: MONGO_INITDB_ROOT_USERNAME
+            - name: MONGO_INITDB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cricpsr-secrets
+                  key: MONGO_INITDB_ROOT_PASSWORD
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
